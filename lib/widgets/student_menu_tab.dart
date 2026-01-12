@@ -34,7 +34,7 @@ class _StudentMenuTabState extends State<StudentMenuTab> with AutomaticKeepAlive
              }
              
              final List<MenuItem> allItems = snapshot.data as List<MenuItem>;
-             final List<MenuItem> items = allItems.where((i) => i.isAvailable).toList();
+             final List<MenuItem> items = allItems; // Show all items, including unavailable ones
              
              return GridView.builder(
                padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),

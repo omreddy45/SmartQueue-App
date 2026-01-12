@@ -3,6 +3,7 @@ import '../models/user_role.dart';
 import '../models/canteen.dart';
 import '../models/menu_item.dart';
 import '../services/backend_service.dart';
+import '../services/notification_service.dart';
 
 class AppState extends ChangeNotifier {
   UserRole _currentRole = UserRole.none;
@@ -17,7 +18,7 @@ class AppState extends ChangeNotifier {
   Canteen? get selectedCanteen => _selectedCanteen;
   BackendService get backendService => _backendService;
 
-  Future<bool> login(String email, String password) async {
+  Future<String?> login(String email, String password) async {
      // Reset state on new login attempt
      _selectedCanteen = null;
      _cart.clear();
@@ -36,8 +37,6 @@ class AppState extends ChangeNotifier {
             final roleStr = details['role'] as String;
             _currentRole = UserRole.values.firstWhere((e) => e.toString().split('.').last == roleStr, orElse: () => UserRole.student);
             
-            // Only set canteen if user is Admin/Staff (typically has canteenId)
-            // Explicitly skip for Students to force QR scan
             if (_currentRole != UserRole.student && details.containsKey('canteenId')) {
                final canteen = await _backendService.getCanteen(details['canteenId']);
                if (canteen != null) {
@@ -45,14 +44,15 @@ class AppState extends ChangeNotifier {
                }
             }
             
+            await _initApp(); // Initialize Notifications
             notifyListeners();
-            return true;
+            return null; // Success (no error)
          }
        }
-       return false;
+       return "User user not found in database or invalid credentials.";
      } catch (e) {
        print("Login Provider Error: $e");
-       return false;
+       return e.toString();
      }
   }
 
@@ -66,19 +66,20 @@ class AppState extends ChangeNotifier {
          "name": name
        };
        _currentRole = UserRole.student;
+       await _initApp();
        notifyListeners();
        return true;
      }
      return false;
   }
 
-  Future<bool> registerCanteen(String canteenName, String campus, String email, String password) async {
+  Future<String?> registerCanteen(String canteenName, String campus, String email, String password) async {
       final user = await _backendService.registerCanteen(canteenName, campus, email, password);
       if (user != null) {
          // Re-fetch to get correct state including canteenId
          return await login(email, password);
       }
-      return false;
+      return "Registration failed. Please check your details.";
   }
 
   void setRole(UserRole role) {
@@ -91,6 +92,20 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _initApp() async {
+    // 1. Init Notification Service
+    try {
+      final notif = NotificationService();
+      await notif.initialize();
+      final token = await notif.getDeviceToken();
+      if (token != null && _currentUser != null && _currentUser!['role'] == UserRole.student.name) {
+         await _backendService.saveUserFcmToken(_currentUser!['uid'], token);
+      }
+    } catch (e) {
+      print("Notification Init Error: $e");
+    }
+  }
+
   Future<void> selectCanteenById(String id) async {
     final canteen = await _backendService.getCanteen(id);
     if (canteen != null) {
@@ -101,9 +116,7 @@ class AppState extends ChangeNotifier {
 
   void exitCanteen() {
     _selectedCanteen = null;
-    _currentRole = UserRole.none; // Typically keeps role but exits canteen context? User said "Student logs out".
-    // If just exiting canteen (like back button), we keep Role.
-    // But since this is exitCanteen mostly for student switching:
+    // Do NOT reset _currentRole. This allows "Scan QR" to go back to Scanner without full logout.
     _cart.clear(); // Clear cart for that canteen
     notifyListeners();
   }

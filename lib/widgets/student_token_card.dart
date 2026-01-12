@@ -22,6 +22,7 @@ class StudentTokenCard extends StatefulWidget {
 
 class _StudentTokenCardState extends State<StudentTokenCard> {
   String? _aiInsight;
+  String? _aiTime; 
 
   @override
   void initState() {
@@ -35,18 +36,16 @@ class _StudentTokenCardState extends State<StudentTokenCard> {
   }
   
   void _fetchInsight() async {
-     // Small delay to ensure build context
      await Future.delayed(Duration.zero);
      if (!mounted) return;
      
      final backend = Provider.of<AppState>(context, listen: false).backendService;
-     final insight = await backend.getStudentTokenInsight(
-       widget.token.status.toString().split('.').last, 
-       widget.queuePosition ?? 0, 
-       widget.token.estimatedWaitTimeMinutes
-     );
+     final res = await backend.getEnhancedTokenInsight(widget.token, widget.queuePosition ?? 0);
      
-     if (mounted) setState(() { _aiInsight = insight; });
+     if (mounted) setState(() { 
+       _aiTime = res['estimated_time'];
+       _aiInsight = res['insight']; 
+     });
   }
 
   @override
@@ -131,7 +130,7 @@ class _StudentTokenCardState extends State<StudentTokenCard> {
                 ),
               ),
 
-              // Status Badges (Completed/Cancelled only now, Ready is handled by main header text/color)
+              // Status Badges
               if (isCompleted)
                  Positioned(top: 16, right: 16, child: _buildStatusBadge("COMPLETED", Colors.white, Colors.black)),
               if (isCancelled)
@@ -150,8 +149,14 @@ class _StudentTokenCardState extends State<StudentTokenCard> {
                      children: [
                        Expanded(child: _buildStatBox("POSITION", "${widget.queuePosition ?? '-'}", LucideIcons.users)),
                        const SizedBox(width: 16),
+                       // Show AI Time if available, else static
                        Expanded(
-                         child: _buildStatBox("EST. WAIT", "${token.estimatedWaitTimeMinutes}", LucideIcons.clock, unit: "m")
+                         child: _buildStatBox(
+                           _aiTime != null ? "AI EST. WAIT" : "EST. WAIT", 
+                           _aiTime != null ? "$_aiTime" : "${token.estimatedWaitTimeMinutes}", 
+                           LucideIcons.clock, 
+                           unit: "m"
+                         )
                        ),
                      ],
                    ),
@@ -167,17 +172,18 @@ class _StudentTokenCardState extends State<StudentTokenCard> {
                      child: Row(
                        crossAxisAlignment: CrossAxisAlignment.start,
                        children: [
-                         Icon(LucideIcons.sparkles, size: 18, color: headerColor), // Use header color for icon
+                         Icon(LucideIcons.sparkles, size: 18, color: headerColor), 
                          const SizedBox(width: 12),
                          Expanded(
                            child: Text(
                              _aiInsight != null 
                              ? '"$_aiInsight"'
-                             : '"Calculating best estimate based on current kitchen load..."',
-                             style: const TextStyle(
+                             : '"Analyzing queue & complexity..."',
+                             style: TextStyle(
                                fontSize: 13, 
-                               color: Color(0xFF3730A3), // Darker indigo text
-                               height: 1.5
+                               color: const Color(0xFF3730A3), 
+                               height: 1.5,
+                               fontStyle: _aiInsight == null ? FontStyle.italic : FontStyle.normal
                              ),
                            ),
                          ),
@@ -197,6 +203,7 @@ class _StudentTokenCardState extends State<StudentTokenCard> {
       ),
     );
   }
+
 
   Widget _buildStatusBadge(String text, Color bg, Color textCol) {
      return Container(

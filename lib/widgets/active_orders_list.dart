@@ -63,18 +63,28 @@ class ActiveOrdersList extends StatelessWidget {
           children: [
              Row(
               children: [
-                 Container(
-                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                   decoration: BoxDecoration(
-                     color: isReady ? Colors.green.shade50 : Colors.blue.shade50,
-                     borderRadius: BorderRadius.circular(12),
-                     border: Border.all(color: isReady ? Colors.green.shade100 : Colors.blue.shade100)
+                   Container(
+                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                     decoration: BoxDecoration(
+                       color: token.isOffline ? Colors.amber.shade100 : (isReady ? Colors.green.shade50 : Colors.blue.shade50),
+                       borderRadius: BorderRadius.circular(12),
+                       border: Border.all(color: token.isOffline ? Colors.amber.shade700 : (isReady ? Colors.green.shade100 : Colors.blue.shade100), width: token.isOffline ? 2 : 1)
+                     ),
+                     child: Row(
+                       mainAxisSize: MainAxisSize.min,
+                       children: [
+                         Text(
+                           token.tokenNumber,
+                           style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: token.isOffline ? Colors.amber.shade900 : (isReady ? Colors.green.shade700 : Colors.blue.shade700)),
+                         ),
+                         if (token.isOffline) 
+                           Padding(
+                             padding: const EdgeInsets.only(left: 8.0),
+                             child: Icon(LucideIcons.megaphone, size: 20, color: Colors.amber.shade900),
+                           )
+                       ],
+                     ),
                    ),
-                   child: Text(
-                     token.tokenNumber,
-                     style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: isReady ? Colors.green.shade700 : Colors.blue.shade700),
-                   ),
-                 ),
                  const SizedBox(width: 16),
                  Expanded(
                    child: Column(

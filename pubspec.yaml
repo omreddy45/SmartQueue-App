@@ -9,21 +9,30 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  firebase_core: ^2.24.2
-  firebase_database: ^10.4.0
-  firebase_auth: ^4.16.0
-  google_generative_ai: ^0.4.6
+  firebase_core: ^3.0.0
+  firebase_database: ^11.0.0
+  firebase_auth: ^5.0.0
+  google_generative_ai: ^0.4.7
   provider: ^6.1.1
   lucide_icons: ^0.257.0
   cupertino_icons: ^1.0.2
   qr_flutter: ^4.1.0 # For generating QRs (Admin)
   mobile_scanner: ^3.5.5 # For scanning QRs (Student)
   intl: ^0.20.2
+  razorpay_flutter: ^1.4.0
+  image_picker: ^1.0.7
+  firebase_messaging: ^15.2.10
+  flutter_local_notifications: ^19.5.0
+  http: ^1.6.0
+  googleapis_auth: ^2.0.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^2.0.0
+
+dependency_overrides:
+  fluttertoast: ^8.2.9
 
 flutter:
   uses-material-design: true

@@ -1,24 +1,31 @@
 import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-// import 'package:google_generative_ai/google_generative_ai.dart'; // Replaced by Manual REST
+import 'package:google_generative_ai/google_generative_ai.dart';
 import '../models/canteen.dart';
 import '../models/token.dart';
 import '../models/queue_stats.dart';
 import '../models/menu_item.dart';
 import '../secrets.dart';
 
-import 'package:http/http.dart' as http;
-import 'dart:convert';
 import 'dart:math';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:googleapis_auth/auth_io.dart' as auth;
 
 class BackendService {
   final DatabaseReference _db = FirebaseDatabase.instance.ref();
   final FirebaseAuth _auth = FirebaseAuth.instance;
   
-  // Gemini API Key (Manual REST)
-  final String _apiKey = geminiApiKey; 
+  // Gemini Model
+  late final GenerativeModel _model;
+  final String _apiKey = Secrets.geminiApiKey; 
 
-  BackendService();
+  BackendService() {
+    _model = GenerativeModel(
+      model: 'gemini-2.5-flash', // Updated to latest stable version (Jan 2026)
+      apiKey: _apiKey,
+    );
+  }
 
   // --- Auth & User Management ---
   
@@ -106,9 +113,9 @@ class BackendService {
          return "Success";
        }
        return "Failed to create user";
-     } catch (e) {
-       return e.toString();
-     }
+      } catch (e) {
+        throw e.toString();
+      }
   }
 
   Future<User?> login(String email, String password) async {
@@ -116,8 +123,8 @@ class BackendService {
        final cred = await _auth.signInWithEmailAndPassword(email: email, password: password);
        return cred.user;
      } catch (e) {
-       print("Login Error: $e");
-       return null;
+       // Propagate error
+       rethrow;
      }
   }
 
@@ -132,6 +139,10 @@ class BackendService {
   Future<String?> getUserRole(String uid) async {
      final snap = await _db.child('users/$uid/role').get();
      return snap.exists ? snap.value as String : null;
+  }
+
+  Future<void> saveUserFcmToken(String userId, String token) async {
+     await _db.child('users/$userId/fcmToken').set(token);
   }
 
   // --- Menu Management ---
@@ -182,8 +193,8 @@ class BackendService {
     return null;
   }
 
-  // Updated to include userId and CanteenId
-  Future<Token> createToken(String canteenId, String userId, List<Map<String, dynamic>> items) async {
+  // Updated to include userId and CanteenId and isOffline
+  Future<Token> createToken(String canteenId, String userId, List<Map<String, dynamic>> items, {bool isOffline = false}) async {
     final todayStart = DateTime.now().copyWith(hour: 0, minute: 0, second: 0, millisecond: 0).millisecondsSinceEpoch;
     
     // Get numeric ID for today
@@ -206,13 +217,15 @@ class BackendService {
     final newToken = Token(
       id: newId,
       canteenId: canteenId,
+      userId: userId, // Added userId to Token model
       couponCode: userId, 
       tokenNumber: _generateTokenNumber(count),
       foodItem: foodItemSummary,
       items: items,
       status: OrderStatus.WAITING,
       timestamp: DateTime.now().millisecondsSinceEpoch,
-      estimatedWaitTimeMinutes: 5 * items.length, 
+      estimatedWaitTimeMinutes: 5 * items.length,
+      isOffline: isOffline, 
     );
 
     // Save under global tokens (indexed)
@@ -257,11 +270,16 @@ class BackendService {
   }
 
   Stream<List<Token>> getKitchenOrdersStream(String canteenId) {
-    return _db.child('tokens').orderByChild('canteenId').equalTo(canteenId).onValue.map((event) {
+    // Updated to Client-Side Filtering
+    return _db.child('tokens').onValue.map((event) {
       final data = event.snapshot.value;
       if (data == null) return <Token>[]; // Typed empty list
+      
       final Map<dynamic, dynamic> map = data as Map;
-      final tokens = map.values.map((e) => Token.fromJson(e as Map)).toList();
+      final tokens = map.values
+        .map((e) => Token.fromJson(Map<String, dynamic>.from(e as Map)))
+        .where((t) => t.canteenId == canteenId)
+        .toList();
       
       // Kitchen wants WAITING and READY (to see what's done)
       return tokens.where((t) => t.status != OrderStatus.COMPLETED)
@@ -270,7 +288,29 @@ class BackendService {
   }
 
   Future<void> markOrderReady(String tokenId) async {
-      await _db.child('tokens/$tokenId').update({'status': 'READY'});
+      await _db.child('tokens/$tokenId').update({
+        'status': 'READY',
+        'readyAt': DateTime.now().millisecondsSinceEpoch
+      });
+      
+      // Notify User
+      try {
+        final snap = await _db.child('tokens/$tokenId').get();
+        if (snap.exists) {
+           final token = Token.fromJson(Map<String, dynamic>.from(snap.value as Map));
+           
+           // Skip if offline order
+           if (token.isOffline) {
+             print("Skipping notification for Offline Order ${token.tokenNumber}");
+             return;
+           }
+
+           // Send Notification
+           await sendPushNotification(token.userId, "Order Ready!", "Your order ${token.tokenNumber} is ready to collect.");
+        }
+      } catch (e) {
+        print("Error triggering notif: $e");
+      }
   }
   
   Future<void> completeOrder(String tokenId) async {
@@ -347,35 +387,51 @@ class BackendService {
      return await getStatsStream(canteenId).first;
   }
 
+  // AI Caching Variables
+  DateTime? _lastAiFetchTime;
+  double _cachedPerOrderRate = 4.0; // Default: 4 minutes per order (Conservative)
+
   Stream<QueueStats> getStatsStream(String canteenId) {
-    return _db.child('tokens').orderByChild('canteenId').equalTo(canteenId).onValue.map((event) {
+    // Robust Fix: Fetch ALL tokens and filter in code (Avoids indexing issues)
+    return _db.child('tokens').onValue.asyncMap((event) async {
       if (!event.snapshot.exists) {
-        return QueueStats(totalOrdersToday: 0, averageWaitTime: 0, peakHour: 'N/A', activeQueueLength: 0);
+        return QueueStats(totalOrdersToday: 0, averageWaitTime: 0, peakHour: 'N/A', activeQueueLength: 0, topItems: {});
       }
       
       final data = event.snapshot.value as Map;
-      final tokens = data.values.map((e) => Token.fromJson(e as Map)).toList();
+      final tokens = data.values
+        .map((e) => Token.fromJson(Map<String,dynamic>.from(e as Map)))
+        .where((t) => t.canteenId == canteenId)
+        .toList();
       
       final todayStart = DateTime.now().copyWith(hour: 0, minute: 0, second: 0, millisecond: 0).millisecondsSinceEpoch;
       final todayTokens = tokens.where((t) => t.timestamp >= todayStart).toList();
       
       final completed = todayTokens.where((t) => t.status == OrderStatus.COMPLETED && t.completedAt != null).toList();
       
+      // 1. Avg Wait Calculation (Historical Fallback)
       double totalWait = 0;
       for (var t in completed) {
           totalWait += (t.completedAt! - t.timestamp);
       }
+      final historicalAvg = completed.isNotEmpty ? (totalWait / completed.length / 60000).round() : 0;
       
-      final avgWait = completed.isNotEmpty ? (totalWait / completed.length / 60000).round() : 0;
-      final active = todayTokens.where((t) => t.status == OrderStatus.WAITING).length;
+      // Update default rate if history is available (Blend with heuristic)
+      if (historicalAvg > 0 && completed.isNotEmpty) {
+         // If avg wait is 15 mins for completed orders, and typical queue was X... 
+         // Hard to derive rate without queue history. 
+         // Instead, we just trust the cached rate or default.
+      }
 
-      // Peak Hour Calculation
+      // 2. Queue Length
+      final active = todayTokens.where((t) => t.status == OrderStatus.WAITING || t.status == OrderStatus.READY).length;
+
+      // 3. Peak Hour
       final hourCounts = <int, int>{};
       for (var t in todayTokens) {
          final hour = DateTime.fromMillisecondsSinceEpoch(t.timestamp).hour;
          hourCounts[hour] = (hourCounts[hour] ?? 0) + 1;
       }
-      
       String peakHour = "N/A";
       if (hourCounts.isNotEmpty) {
         final maxHour = hourCounts.entries.reduce((a, b) => a.value > b.value ? a : b).key;
@@ -384,11 +440,57 @@ class BackendService {
         peakHour = "$displayHour $ampm";
       }
 
+      // 4. Top Items Calculation
+      final itemCounts = <String, int>{};
+      for (var t in todayTokens) {
+        if (t.items == null) continue;
+        for (var item in t.items!) {
+           final name = item['name'] as String;
+           final qty = item['quantity'] as int;
+           itemCounts[name] = (itemCounts[name] ?? 0) + qty;
+        }
+      }
+      final sortedItems = itemCounts.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+      final topItems = Map.fromEntries(sortedItems.take(5));
+      final topItemsStr = topItems.keys.join(", ");
+
+      // 5. Smart Wait Time (Formula + AI Tuning)
+      int estimatedWait = 0;
+      if (active > 0) {
+         // A. Calculate Formula Baseline
+         estimatedWait = (active * _cachedPerOrderRate).round();
+
+         // B. Check if we should update Rate with AI (Throttle: 5 mins)
+         bool shouldCallAi = _lastAiFetchTime == null || DateTime.now().difference(_lastAiFetchTime!).inMinutes >= 5;
+         
+         if (shouldCallAi) {
+             try {
+               print("Calling Gemini for Stats (Throttled)...");
+               final prompt = "Analyze Canteen Queue: $active active orders. Top items: $topItemsStr. Time: ${DateTime.now().hour}h. Historical Avg: $historicalAvg min. Estimate REALISTIC wait time (in minutes) for a NEW order. Consider item complexity (e.g. Tea=fast, Meal=slow). Return ONLY the integer number.";
+               final aiRes = await _callGeminiSafe(prompt);
+               final parsed = int.tryParse(aiRes.replaceAll(RegExp(r'[^0-9]'), ''));
+               
+               if (parsed != null && parsed > 0) {
+                 estimatedWait = parsed;
+                 // Update Rate for subsequent formula calls
+                 _cachedPerOrderRate = parsed / active;
+                 _lastAiFetchTime = DateTime.now();
+               }
+             } catch (e) {
+               print("AI Stats Skipped (Quota/Error): $e");
+               // Keep using existing _cachedPerOrderRate in next event
+             }
+         }
+      } else {
+         estimatedWait = 0; 
+      }
+
       return QueueStats(
         totalOrdersToday: todayTokens.length,
-        averageWaitTime: avgWait,
+        averageWaitTime: estimatedWait, 
         peakHour: peakHour, 
-        activeQueueLength: active
+        activeQueueLength: active,
+        topItems: topItems,
       );
     }).asBroadcastStream();
   }
@@ -408,11 +510,14 @@ class BackendService {
   }
   
   Stream<Map<String, int>> getHourlyTrafficStream(String canteenId) {
-     return _db.child('tokens').orderByChild('canteenId').equalTo(canteenId).onValue.map((event) {
+     return _db.child('tokens').onValue.map((event) {
         if (!event.snapshot.exists) return <String, int>{};
         
         final data = event.snapshot.value as Map;
-        final tokens = data.values.map((e) => Token.fromJson(e as Map)).toList();
+        final tokens = data.values
+            .map((e) => Token.fromJson(e as Map))
+            .where((t) => t.canteenId == canteenId)
+            .toList();
         
         final todayStart = DateTime.now().copyWith(hour: 0, minute: 0, second: 0, millisecond: 0).millisecondsSinceEpoch;
         final todayTokens = tokens.where((t) => t.timestamp >= todayStart).toList();
@@ -438,32 +543,36 @@ class BackendService {
        return await getHourlyTrafficStream(canteenId).first;
   }
 
-  // --- AI Insights (Manual REST v1 to bypass SDK v1beta issues) ---
+  // --- AI Insights (Using Google Generative AI SDK) ---
 
   Future<String> getDashboardInsights(QueueStats stats, Map<String, int> traffic) async {
     try {
+      final topItemsList = stats.topItems.entries.map((e) => "${e.key} (${e.value})").join(", ");
+      
       final prompt = """
 Analyze this canteen data: 
 Total Orders: ${stats.totalOrdersToday}
 Active Queue: ${stats.activeQueueLength}
 Avg Wait: ${stats.averageWaitTime}m
 Peak Hour: ${stats.peakHour}
+Top Selling Items: $topItemsList
 
 Generate a report in this EXACT format:
 Report Generated
-✓ [One short bold status, e.g. Queue Clear]
-• [Actionable insight 1]
-• [Actionable insight 2]
-• [System readiness status]
+✓ [One short bold status, e.g. High Demand/Queue Clear]
+• [Insight on most popular items and trends]
+• [Insight on staffing efficiency based on wait time]
+• [Insight on system readiness or peak hour prep]
 
 Keep it professional and concise.
 """;
       
-      return await _callGeminiRest(prompt);
+      return await _callGeminiSafe(prompt);
       
     } catch (e) {
+      print("Gemini Analysis Error: $e"); // Log full error
       if (e.toString().contains("429")) return "Daily Quota Exceeded (Try later).";
-      return "Insight generation failed: ${e.toString().substring(0, min(e.toString().length, 50))}...";
+      return "Error: $e";
     }
   }
 
@@ -472,44 +581,78 @@ Keep it professional and concise.
         final randomContext = Random().nextBool() ? "Checking kitchen load..." : "Analyzing chef speed...";
         final prompt = "Student order status: $tokenStatus, Queue Position: $queuePos, Est Wait: $waitTime min. Current Context: $randomContext. Give a 1 unique sentence reassuring insight (max 15 words) for the student. Vary the tone.";
         
-        print("CALLING GEMINI REST API (v1) - Status: $tokenStatus"); 
-
-        return await _callGeminiRest(prompt);
-
+        print("CALLING GEMINI SDK - Status: $tokenStatus"); 
+        return await _callGeminiSafe(prompt);
      } catch(e) {
-       print("GEMINI REST API ERROR: $e"); 
-       if (e.toString().contains("429")) return "Daily Quota Exceeded (Try later).";
-       return "Kitchen is working on your order.";
+       return "Your order is being prepared!"; 
      }
   }
 
-  // Helper for Raw HTTP Call to v1beta (v1 returned 404, so 1.5 Flash requires v1beta)
-  Future<String> _callGeminiRest(String promptText) async {
-      final url = Uri.parse('https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=$_apiKey');
-      
-      final response = await http.post(
-        url,
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          "contents": [{
-            "parts": [{"text": promptText}]
-          }]
-        })
-      );
+  // --- Enhanced AI Insights for Student Token ---
+  Future<Map<String, String>> getEnhancedTokenInsight(Token token, int queuePos) async {
+    try {
+       // 1. Fetch current stats for context
+       final stats = await getStatsStream(token.canteenId).first;
+       
+       // 2. Format Items
+       String itemsList = "";
+       if (token.items != null) {
+          itemsList = token.items!.map((i) => "${i['name']} (x${i['quantity']})").join(", ");
+       } else {
+          itemsList = token.foodItem;
+       }
 
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        // Navigate JSON: candidates[0].content.parts[0].text
-        try {
-           return data['candidates'][0]['content']['parts'][0]['text'];
-        } catch (e) {
-           return "Analysis unavailable.";
-        }
-      } else {
-        throw Exception('Failed to load: ${response.statusCode} ${response.body}');
-      }
+       // 3. Construct Prompt
+       final prompt = """
+Analyze this student order for a University Canteen:
+- Items Ordered: $itemsList
+- Queue Position: $queuePos
+- Total Active Orders in Canteen: ${stats.activeQueueLength}
+- Historical Avg Wait: ${stats.averageWaitTime} min
+
+Rules for Estimation:
+1. Instant Items: Tea, Coffee, Cold Drinks, Chips (Pre-packaged or thermos). Time: 1-2 min irrespective of queue.
+2. Fast Items: Samosa, Vada Pav, Puffs (Already prepared, just heating/serving). Time: 2-4 min.
+3. Cooked Items: Dosa, Noodles, Meals (Freshly made). Time: 8-15 min depending on queue.
+4. Queue Factor: Add 1-2 min per person ahead ONLY IF items require cooking.
+
+Calculate a REALISTIC wait time for this specific order.
+Provide a JSON response EXACTLY like this (no markdown, just raw json):
+{
+  "estimated_time": "10-15",
+  "insight": "Short friendly reason (max 10 words, e.g. 'Tea is ready, just pouring!')"
+}
+""";
+
+       final responseText = await _callGeminiSafe(prompt);
+       
+       // 4. Parse JSON
+       final cleaned = responseText.replaceAll('```json', '').replaceAll('```', '').trim();
+       final json = jsonDecode(cleaned);
+       return {
+         "estimated_time": json['estimated_time']?.toString() ?? "${token.estimatedWaitTimeMinutes}",
+         "insight": json['insight']?.toString() ?? "Preparing your order..."
+       };
+
+    } catch (e) {
+      print("AI Token Error: $e");
+      return {
+        "estimated_time": "${token.estimatedWaitTimeMinutes}",
+        "insight": "Cooking up something good!"
+      };
+    }
   }
 
+  // Helper for all Gemini calls
+  Future<String> _callGeminiSafe(String prompt) async {
+     try {
+       final content = [Content.text(prompt)];
+       final response = await _model.generateContent(content);
+       return response.text ?? "Analysis failed.";
+     } catch (e) {
+       throw e; // Rethrow to be handled by caller
+     }
+  }
 
   // Helpers
   String _generateId() => DateTime.now().millisecondsSinceEpoch.toString() + Random().nextInt(1000).toString();
@@ -519,10 +662,10 @@ Keep it professional and concise.
   Future<String> getAIWaitTimeReasoning(int activeOrders, int chefs) async {
       try {
         final prompt = "Explain briefly (1 sentence) why the wait time might be high. Context: $activeOrders active orders, $chefs chefs working.";
-        return await _callGeminiRest(prompt);
+        return await _callGeminiSafe(prompt);
       } catch (e) {
-        // Fallback or explicit error handling
-        return "Analyzing queue dynamics...";
+        print("Gemini Analysis Error: $e");
+        return "Error: $e"; 
       }
   }
   
@@ -530,6 +673,78 @@ Keep it professional and concise.
     final Map<String, dynamic> updates = {'estimatedWaitTimeMinutes': minutes};
     if (reasoning != null) updates['aiReasoning'] = reasoning;
     await _db.child('tokens/$tokenId').update(updates);
+  }
+
+  // --- FCM Notifications (V1 API) ---
+  
+  Future<String?> _getAccessToken() async {
+    try {
+      final serviceAccountCredentials = auth.ServiceAccountCredentials.fromJson(Secrets.serviceAccountJson);
+      final scopes = ['https://www.googleapis.com/auth/firebase.messaging'];
+    final client = await auth.clientViaServiceAccount(serviceAccountCredentials, scopes);
+    final credentials = client.credentials; 
+    return credentials.accessToken.data;
+    } catch (e) {
+      print("OAuth Token Error: $e");
+      return null;
+    }
+  }
+
+  Future<void> sendPushNotification(String userId, String title, String body) async {
+     try {
+       // 1. Get User Device Token
+       final snap = await _db.child('users/$userId/fcmToken').get();
+       if (!snap.exists) return;
+       final deviceToken = snap.value as String;
+
+       // 2. Get OAuth Access Token
+       final accessToken = await _getAccessToken();
+       if (accessToken == null) {
+         print("Failed to get Access Token for FCM");
+         return;
+       }
+
+       // 3. Send via FCM V1 Endpoint
+       final String projectId = Secrets.projectId; 
+       final Uri url = Uri.parse('https://fcm.googleapis.com/v1/projects/$projectId/messages:send');
+
+       final response = await http.post(
+         url,
+         headers: <String, String>{
+           'Content-Type': 'application/json',
+           'Authorization': 'Bearer $accessToken',
+         },
+         body: jsonEncode({
+           "message": {
+             "token": deviceToken,
+             "notification": {
+               "title": title,
+               "body": body,
+             },
+             "data": {
+               "click_action": "FLUTTER_NOTIFICATION_CLICK",
+               "id": "1",
+               "status": "done"
+             },
+             "android": {
+               "priority": "high",
+               "notification": {
+                 "channel_id": "order_updates"
+               }
+             }
+           }
+         }),
+       );
+
+       if (response.statusCode == 200) {
+          print("Notification Sent to $userId (V1)");
+       } else {
+          print("FCM V1 Error: ${response.statusCode} - ${response.body}");
+       }
+
+     } catch (e) {
+       print("FCM Error: $e");
+     }
   }
 
   String getDemoCanteenId() {

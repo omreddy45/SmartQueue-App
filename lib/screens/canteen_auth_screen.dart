@@ -95,12 +95,12 @@ class _CanteenAuthScreenState extends State<CanteenAuthScreen> {
   void _handleAuth() async {
     setState(() => _isLoading = true);
     final state = Provider.of<AppState>(context, listen: false);
-    bool success;
+    String? error;
 
     if (_mode == 0) {
-      success = await state.login(_emailCtrl.text, _passCtrl.text);
+      error = await state.login(_emailCtrl.text, _passCtrl.text);
     } else {
-      success = await state.registerCanteen(
+      error = await state.registerCanteen(
           _canteenNameCtrl.text, 
           _campusCtrl.text, 
           _emailCtrl.text, 
@@ -110,11 +110,11 @@ class _CanteenAuthScreenState extends State<CanteenAuthScreen> {
 
     if (mounted) {
       setState(() => _isLoading = false);
-      if (success) {
+      if (error == null) {
         // Pop back to home which will redirect based on Auth State
         Navigator.popUntil(context, (route) => route.isFirst);
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Authentication Failed")));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Authentication Failed: $error")));
       }
     }
   }

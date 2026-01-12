@@ -5,6 +5,9 @@ import 'package:lucide_icons/lucide_icons.dart';
 import '../providers/app_state.dart';
 import '../widgets/student_menu_tab.dart';
 import '../widgets/student_orders_tab.dart';
+import 'package:razorpay_flutter/razorpay_flutter.dart';
+import '../secrets.dart';
+import 'package:image_picker/image_picker.dart';
 
 class StudentView extends StatefulWidget {
   const StudentView({super.key});
@@ -13,7 +16,7 @@ class StudentView extends StatefulWidget {
   State<StudentView> createState() => _StudentViewState();
 }
 
-class _StudentViewState extends State<StudentView> {
+class _StudentViewState extends State<StudentView> with SingleTickerProviderStateMixin {
   // Steps: 0 = Scan, 1 = Menu/Cart, 2 = Active Token
   int _step = 0;
   
@@ -21,15 +24,31 @@ class _StudentViewState extends State<StudentView> {
   MobileScannerController controller = MobileScannerController();
   bool _isScanning = true;
 
+  late Razorpay _razorpay;
+  late TabController _tabController;
+
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    _razorpay = Razorpay();
+    _razorpay.on(Razorpay.EVENT_PAYMENT_SUCCESS, _handlePaymentSuccess);
+    _razorpay.on(Razorpay.EVENT_PAYMENT_ERROR, _handlePaymentError);
+    _razorpay.on(Razorpay.EVENT_EXTERNAL_WALLET, _handleExternalWallet);
+    
     final state = Provider.of<AppState>(context, listen: false);
     // If Backend/AppState remembers selection, skip scan
     if (state.selectedCanteen != null) {
       _step = 1;
       _isScanning = false;
     }
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+    _razorpay.clear();
+    _tabController.dispose();
   }
 
   @override
@@ -54,9 +73,7 @@ class _StudentViewState extends State<StudentView> {
            return _buildQRScanner(state);
         }
 
-        return DefaultTabController(
-          length: 2,
-          child: Scaffold(
+        return Scaffold(
             appBar: AppBar(
               title: Text(state.selectedCanteen!.name),
 
@@ -70,6 +87,7 @@ class _StudentViewState extends State<StudentView> {
                      borderRadius: BorderRadius.circular(30),
                    ),
                    child: TabBar(
+                     controller: _tabController,
                      indicator: BoxDecoration(
                        color: Colors.black, // Active color
                        borderRadius: BorderRadius.circular(26),
@@ -121,8 +139,9 @@ class _StudentViewState extends State<StudentView> {
                 )
               ],
             ),
-            body: const TabBarView(
-              children: [
+            body: TabBarView(
+              controller: _tabController,
+              children: const [
                 StudentMenuTab(),
                 StudentOrdersTab(), 
               ],
@@ -134,11 +153,17 @@ class _StudentViewState extends State<StudentView> {
                   icon: const Icon(LucideIcons.shoppingBag),
                 )
               : null,
-          ),
-        );
+          );
       },
     );
   }
+
+  // _buildQRScanner and _showCartSheet unchanged... (omitted from replacement for brevity, but tool needs exact target match so might need careful splicing if targeting whole file)
+  // Wait, I am using StartLine/EndLine, so I'll target the top of the class down to before _buildQRScanner.
+
+  // Actually, I can target specific chunks to be safer.
+
+
 
   Widget _buildQRScanner(AppState state) {
     return Scaffold(
@@ -187,6 +212,21 @@ class _StudentViewState extends State<StudentView> {
                   children: [
                      const Text("Point camera at the Canteen QR Code", style: TextStyle(fontSize: 16)),
                      const SizedBox(height: 16),
+                     
+                     // Gallery Scan Button
+                     ElevatedButton.icon(
+                       onPressed: _scanFromGallery,
+                       icon: const Icon(LucideIcons.image),
+                       label: const Text("Scan from Gallery"),
+                       style: ElevatedButton.styleFrom(
+                         backgroundColor: Colors.blue.shade50,
+                         foregroundColor: Colors.blue.shade700,
+                         elevation: 0,
+                         padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                       ),
+                     ),
+                     
+                     const SizedBox(height: 16),
                      const Text("OR", style: TextStyle(color: Colors.grey)),
                      const SizedBox(height: 16),
                      ElevatedButton(
@@ -206,6 +246,23 @@ class _StudentViewState extends State<StudentView> {
         ],
       ),
     );
+  }
+
+  Future<void> _scanFromGallery() async {
+    final ImagePicker picker = ImagePicker();
+    final XFile? image = await picker.pickImage(source: ImageSource.gallery);
+    if (image == null) return;
+
+    if (mounted) {
+       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Analyzing image...")));
+    }
+
+    final success = await controller.analyzeImage(image.path);
+    if (!success) {
+      if (mounted) {
+         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("No QR code found in image!")));
+      }
+    }
   }
 
   void _showCartSheet(BuildContext context, AppState state) {
@@ -243,12 +300,18 @@ class _StudentViewState extends State<StudentView> {
                    ),
                ),
                ElevatedButton(
-                 onPressed: state.cart.isEmpty ? null : () async {
-                    Navigator.pop(sheetContext); // Close sheet using sheetContext
-                    await _placeOrder(context, state); // Use parent context (from method arg)
+                 onPressed: state.cart.isEmpty ? null : () {
+                    final total = state.cart.values.fold(0.0, (sum, item) => sum + (item.item.price * item.quantity));
+                    Navigator.pop(sheetContext); 
+                    _openCheckout(total, state);
                  },
                  style: ElevatedButton.styleFrom(backgroundColor: Colors.green, foregroundColor: Colors.white, padding: const EdgeInsets.all(16)),
-                 child: const Text("Place Order"),
+                 child: Builder(
+                   builder: (context) {
+                      final total = state.cart.values.fold(0.0, (sum, item) => sum + (item.item.price * item.quantity));
+                      return Text("Pay ₹${total.toStringAsFixed(2)}");
+                   }
+                 ),
                )
              ],
            ),
@@ -275,7 +338,7 @@ class _StudentViewState extends State<StudentView> {
        if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Order Placed Successfully!")));
           // Navigate to Tokens Tab and Force Refresh
-          DefaultTabController.of(context).animateTo(1);
+          _tabController.animateTo(1);
           setState(() {}); 
        }
      } catch (e) {
@@ -286,7 +349,74 @@ class _StudentViewState extends State<StudentView> {
      }
   }
 
+  void _openCheckout(double amount, AppState state) {
+    debugPrint("Razorpay Key: ${Secrets.razorpayKeyId} (Length: ${Secrets.razorpayKeyId.length})");
+    var options = {
+      'key': Secrets.razorpayKeyId.trim(), // Ensure no whitespace
+      'amount': (amount * 100).toInt(), // in paisa
+      'name': state.selectedCanteen?.name ?? 'SmartQueue',
+      'description': 'Order Payment',
+      'prefill': {
+        'contact': '9876543210', 
+        'email': state.currentUser?['email'] ?? 'student@example.com'
+      },
+      'external': {
+        'wallets': ['paytm']
+      }
+    };
+
+    try {
+      _razorpay.open(options);
+    } catch (e) {
+      debugPrint('Error: $e');
+    }
+  }
+
+  void _handlePaymentSuccess(PaymentSuccessResponse response) {
+    final state = Provider.of<AppState>(context, listen: false);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(LucideIcons.checkCircle, color: Colors.white),
+            const SizedBox(width: 12),
+            Expanded(child: Text("Payment Successful! Ref: ${response.paymentId}")),
+          ],
+        ),
+        backgroundColor: Colors.green.shade600,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        margin: const EdgeInsets.all(16),
+        duration: const Duration(seconds: 4),
+      )
+    );
+    _placeOrder(context, state);
+  }
+
+  void _handlePaymentError(PaymentFailureResponse response) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(LucideIcons.xCircle, color: Colors.white),
+            const SizedBox(width: 12),
+            Expanded(child: Text("Payment Failed: ${response.code} - ${response.message}")),
+          ],
+        ),
+        backgroundColor: Colors.red.shade600,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        margin: const EdgeInsets.all(16),
+      )
+    );
+  }
+
+  void _handleExternalWallet(ExternalWalletResponse response) {
+    if (mounted) {
+       ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("External Wallet Selected: ${response.walletName}"))
+       );
+    }
+  }
 
 }
-
-

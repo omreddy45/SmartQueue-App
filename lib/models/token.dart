@@ -8,6 +8,7 @@ enum OrderStatus {
 class Token {
   final String id;
   final String canteenId;
+  final String userId; // Added for Notification targeting
   final String couponCode;
   final String tokenNumber;
   final String foodItem; // Summary (e.g. "2x Vada Pav, 1x Coke")
@@ -17,10 +18,12 @@ class Token {
   final int estimatedWaitTimeMinutes;
   final String? aiReasoning;
   final int? completedAt;
+  final bool isOffline;
 
   Token({
     required this.id,
     required this.canteenId,
+    required this.userId,
     required this.couponCode,
     required this.tokenNumber,
     required this.foodItem,
@@ -30,13 +33,15 @@ class Token {
     required this.estimatedWaitTimeMinutes,
     this.aiReasoning,
     this.completedAt,
+    this.isOffline = false,
   });
 
   factory Token.fromJson(Map<dynamic, dynamic> json) {
     return Token(
       id: json['id'] as String,
       canteenId: json['canteenId'] as String,
-      couponCode: json['couponCode'] as String,
+      userId: json['userId'] as String? ?? '', // Fallback for old tokens
+      couponCode: json['couponCode'] as String? ?? '',
       tokenNumber: json['tokenNumber'] as String,
       foodItem: json['foodItem'] as String,
       items: json['items'] != null 
@@ -49,6 +54,7 @@ class Token {
       estimatedWaitTimeMinutes: json['estimatedWaitTimeMinutes'] as int,
       aiReasoning: json['aiReasoning'] as String?,
       completedAt: json['completedAt'] as int?,
+      isOffline: json['isOffline'] as bool? ?? false,
     );
   }
 
@@ -56,6 +62,7 @@ class Token {
     return {
       'id': id,
       'canteenId': canteenId,
+      'userId': userId,
       'couponCode': couponCode,
       'tokenNumber': tokenNumber,
       'foodItem': foodItem,
@@ -65,6 +72,7 @@ class Token {
       'estimatedWaitTimeMinutes': estimatedWaitTimeMinutes,
       'aiReasoning': aiReasoning,
       'completedAt': completedAt,
+      'isOffline': isOffline,
     };
   }
 }

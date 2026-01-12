@@ -23,7 +23,7 @@ class MenuItem {
       name: json['name'] as String,
       icon: json['icon'] as String,
       color: json['color'] as String,
-      price: (json['price'] as num?)?.toDouble() ?? 0.0,
+      price: double.tryParse(json['price'].toString()) ?? 0.0,
       isAvailable: json['isAvailable'] as bool? ?? true,
       category: json['category'] as String? ?? 'General',
     );
